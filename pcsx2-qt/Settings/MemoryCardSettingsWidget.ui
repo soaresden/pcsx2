@@ -10,7 +10,7 @@
     <height>600</height>
    </rect>
   </property>
-  <layout class="QVBoxLayout" name="verticalLayout" stretch="0,1,0">
+  <layout class="QVBoxLayout" name="verticalLayout" stretch="0,0,1">
    <property name="leftMargin">
     <number>0</number>
    </property>
@@ -47,6 +47,16 @@
       <string>Memory Card Slots</string>
      </property>
      <layout class="QGridLayout" name="gridLayout"/>
+    </widget>
+   </item>
+   <item>
+    <widget class="QCheckBox" name="perGameCards">
+     <property name="toolTip">
+      <string>Automatically points Slot 1 at a memory card dedicated to the game being played. An existing card is matched on its serial (e.g. &quot;SCES-50001 ...&quot;), and one is created if none exists yet.</string>
+     </property>
+     <property name="text">
+      <string>Use a separate memory card for each game (Slot 1)</string>
+     </property>
     </widget>
    </item>
    <item>
@@ -185,6 +195,7 @@
   </customwidget>
  </customwidgets>
  <tabstops>
+  <tabstop>perGameCards</tabstop>
   <tabstop>directory</tabstop>
   <tabstop>browse</tabstop>
   <tabstop>open</tabstop>

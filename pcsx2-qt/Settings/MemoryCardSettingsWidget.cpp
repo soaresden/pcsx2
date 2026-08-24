@@ -70,6 +70,13 @@ MemoryCardSettingsWidget::MemoryCardSettingsWidget(SettingsWindow* settings_dial
 	SettingWidgetBinder::BindWidgetToFolderSetting(sif, m_ui.directory, m_ui.browse, m_ui.open, m_ui.reset, "Folders",
 		"MemoryCards", Path::Combine(EmuFolders::DataRoot, "memcards"));
 
+	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.perGameCards, CONFIG_SECTION, "PerGameCards", false);
+	dialog()->registerWidgetHelp(m_ui.perGameCards, tr("Use a separate memory card for each game (Slot 1)"),
+		tr("Unchecked"),
+		tr("Automatically inserts a memory card dedicated to the game being played into Slot 1. Existing cards are "
+		   "matched on the game's serial, so cards named like \"SCES-50001 Tekken Tag Tournament (Europe).bin\" are "
+		   "reused as-is; if no card matches, one is created in the memory cards directory. Slot 2 is left alone."));
+
 	setupAdditionalUi();
 
 	connect(m_ui.directory, &QLineEdit::textChanged, this, &MemoryCardSettingsWidget::refresh);

@@ -126,6 +126,7 @@ namespace VMManager
 
 	static void LoadSettings();
 	static void LoadCoreSettings(SettingsInterface& si);
+	static void ApplyPerGameMemoryCard(SettingsInterface& si);
 	static void ApplyCoreSettings();
 	static void LoadInputBindings(SettingsInterface& si, std::unique_lock<std::mutex>& lock);
 	static bool HasAnyBindingsForPad(const SettingsInterface& si, u32 port);
@@ -173,6 +174,12 @@ static std::string s_title_en_search;
 static std::string s_title_en_replace;
 static u32 s_disc_crc;
 static u32 s_current_crc;
+
+// Cache for the per-game memory card, so we only touch the filesystem when the game changes.
+static std::string s_per_game_memcard_serial;
+static std::string s_per_game_memcard_extension;
+static std::string s_per_game_memcard_template;
+static std::string s_per_game_memcard_name;
 static u32 s_elf_entry_point = 0xFFFFFFFFu;
 static std::string s_elf_path;
 static std::pair<u32, u32> s_elf_text_range;
@@ -666,6 +673,55 @@ void VMManager::LoadCoreSettings(SettingsInterface& si)
 	// Force MTVU off when playing back GS dumps, it doesn't get used.
 	if (GSDumpReplayer::IsReplayingDump())
 		EmuConfig.Speedhacks.vuThread = false;
+
+	// Must come last, it overrides the slot 1 memory card that was just loaded.
+	ApplyPerGameMemoryCard(si);
+}
+
+// Points slot 1 at a memory card dedicated to the running game, creating it if needed.
+// Called on every core settings load so that the override survives any settings change, and so that
+// toggling the option while a game is running takes effect immediately (the resulting change to
+// EmuConfig.Mcd is picked up by CheckForMemoryCardConfigChanges(), which ejects and remounts).
+void VMManager::ApplyPerGameMemoryCard(SettingsInterface& si)
+{
+	if (GSDumpReplayer::IsReplayingDump() || !si.GetBoolValue("MemoryCards", "PerGameCards", false))
+		return;
+
+	std::string serial;
+	std::string title;
+	{
+		std::unique_lock lock(s_info_mutex);
+
+		// No disc, or we haven't identified it yet - keep the globally configured card.
+		if (s_disc_crc == 0 || s_disc_serial.empty() || s_disc_serial == BiosSerial)
+			return;
+
+		serial = s_disc_serial;
+		title = s_title;
+	}
+
+	// NOTE: We're called with the settings lock held, so everything the resolver needs has to be
+	// read from si here, rather than through the Host::Get*SettingValue() helpers.
+	std::string extension(si.GetStringValue("MemoryCards", "PerGameCardsExtension", ".bin"));
+	std::string template_card(si.GetStringValue("MemoryCards", "PerGameCardsTemplate", ""));
+
+	// Resolving hits the filesystem and can create a card, so only redo it when something that
+	// feeds into the result actually changed.
+	if (s_per_game_memcard_serial != serial || s_per_game_memcard_extension != extension ||
+		s_per_game_memcard_template != template_card)
+	{
+		s_per_game_memcard_serial = serial;
+		s_per_game_memcard_extension = std::move(extension);
+		s_per_game_memcard_template = std::move(template_card);
+		s_per_game_memcard_name = FileMcd_GetCardForSerial(
+			serial, title, s_per_game_memcard_extension, s_per_game_memcard_template);
+	}
+
+	if (s_per_game_memcard_name.empty())
+		return;
+
+	// Slot1_Enable is left alone on purpose: if the user turned slot 1 off, they want it off.
+	EmuConfig.Mcd[0].Filename = s_per_game_memcard_name;
 }
 
 void VMManager::LoadInputBindings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
@@ -1164,6 +1220,11 @@ void VMManager::UpdateDiscDetails(bool booting)
 
 void VMManager::ClearDiscDetails()
 {
+	s_per_game_memcard_serial = {};
+	s_per_game_memcard_extension = {};
+	s_per_game_memcard_template = {};
+	s_per_game_memcard_name = {};
+
 	std::unique_lock lock(s_info_mutex);
 	s_disc_crc = 0;
 	s_title = {};

@@ -14,10 +14,13 @@
 #include "common/Path.h"
 #include "common/StringUtil.h"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 
 #include "Config.h"
+#include "GameDatabase.h"
 #include "Host.h"
 #include "VMManager.h"
 #include "IconsPromptFont.h"
@@ -376,25 +379,41 @@ bool FileMemoryCard::Seek(std::FILE* f, u32 adr)
 }
 
 // returns FALSE if an error occurred (either permission denied or disk full)
-bool FileMemoryCard::Create(const char* mcdFile, uint sizeInMB)
+bool FileMcd_CreateBlankCard(const std::string& path, uint size_in_mb, bool no_ecc)
 {
 	//int enc[16] = {0x77,0x7f,0x7f,0x77,0x7f,0x7f,0x77,0x7f,0x7f,0x77,0x7f,0x7f,0,0,0,0};
 
-	Console.WriteLn("(FileMcd) Creating new %uMB memory card: %s", sizeInMB, mcdFile);
+	Console.WriteLn("(FileMcd) Creating new %uMB %s memory card: %s", size_in_mb, no_ecc ? "raw" : "ECC", path.c_str());
 
-	auto fp = FileSystem::OpenManagedCFile(mcdFile, "wb");
+	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "wb");
 	if (!fp)
 		return false;
+
+	// A megabyte of card data is 2048 sectors; with ECC each sector is 528 bytes instead of 512.
+	const u64 total_size = static_cast<u64>(size_in_mb) * (no_ecc ? (1024 * 512 * 2) : MC2_MBSIZE);
 
 	u8 buf[MC2_ERASE_SIZE];
 	std::memset(buf, 0xff, sizeof(buf));
 
-	for (uint i = 0; i < (MC2_MBSIZE * sizeInMB) / sizeof(buf); i++)
+	// The raw size is not a multiple of the erase block size, so write whatever is left over after
+	// the last full block as well.
+	for (u64 written = 0; written < total_size;)
 	{
-		if (std::fwrite(buf, sizeof(buf), 1, fp.get()) != 1)
+		const size_t chunk = static_cast<size_t>(std::min<u64>(sizeof(buf), total_size - written));
+		if (std::fwrite(buf, chunk, 1, fp.get()) != 1)
 			return false;
+
+		written += chunk;
 	}
 	return true;
+}
+
+bool FileMemoryCard::Create(const char* mcdFile, uint sizeInMB)
+{
+	// .bin/.mc2 cards are stored without ECC data, and get converted to the raw layout on open.
+	const std::string_view name(mcdFile);
+	const bool no_ecc = name.ends_with(".bin") || name.ends_with(".mc2");
+	return FileMcd_CreateBlankCard(std::string(name), sizeInMB, no_ecc);
 }
 
 s32 FileMemoryCard::IsPresent(uint slot)
@@ -658,6 +677,16 @@ void FileMcd_Swap()
 	if (MemcardBusy::IsBusy())
 	{
 		Host::AddIconOSDMessage("MemoryCardSwap_Busy", ICON_PF_MEMORY_CARD, TRANSLATE_SV("MemoryCardSwap_Busy", "Memory cards are busy. Can't swap right now."));
+		return;
+	}
+
+	// Slot 1 is owned by the per-game override, and would be put straight back on the next
+	// settings reload - leaving both slots pointing at the same file.
+	if (Host::GetBoolSettingValue("MemoryCards", "PerGameCards", false))
+	{
+		Host::AddIconOSDMessage("MemoryCardSwap_PerGame", ICON_PF_MEMORY_CARD,
+			TRANSLATE_SV("MemoryCardSwap_PerGame",
+				"Can't swap memory cards while per-game memory cards are enabled."));
 		return;
 	}
 
@@ -1137,4 +1166,235 @@ bool FileMcd_DeleteCard(const std::string_view name)
 	}
 
 	return true;
+}
+
+// --------------------------------------------------------------------------------------
+//  Per-Game Memory Cards
+// --------------------------------------------------------------------------------------
+// When enabled, slot 1 is automatically pointed at a memory card dedicated to the running
+// game. An existing card is detected by matching the game's serial against the start of the
+// file name, which makes cards produced by other tools (e.g. OPL VMCs named
+// "SCES-50001 TEKKEN TAG TOURNAMENT (Europe).bin") usable as-is. If no card matches, one is
+// created using the serial, the GameDB title and the region.
+
+namespace
+{
+	// Strips everything but alphanumerics and uppercases, so that "SCES-50001", "SCES_500.01"
+	// and "sces50001" all compare equal.
+	std::string PerGameMcd_NormalizeSerial(const std::string_view str)
+	{
+		std::string ret;
+		ret.reserve(str.size());
+		for (const char ch : str)
+		{
+			if (std::isalnum(static_cast<unsigned char>(ch)))
+				ret.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+		}
+		return ret;
+	}
+
+	bool PerGameMcd_IsCardFileName(const std::string_view name)
+	{
+		// Keep in sync with FileMcd_GetAvailableCards().
+		return name.ends_with(".ps2") || name.ends_with(".bin") || name.ends_with(".mc2") ||
+			   name.ends_with(".mcd") || name.ends_with(".mcr");
+	}
+
+	// Region label used when creating a new card. Derived from the serial prefix, which is more
+	// reliable (and matches third-party naming conventions) than the GameDB region string.
+	std::string_view PerGameMcd_GetRegionName(const std::string_view normalized_serial)
+	{
+		if (normalized_serial.size() < 4)
+			return {};
+
+		const std::string_view prefix = normalized_serial.substr(0, 4);
+		if (prefix.ends_with("ES") || prefix.ends_with("ED"))
+			return "Europe";
+		if (prefix.ends_with("US") || prefix.ends_with("UD"))
+			return "USA";
+		if (prefix.ends_with("PS") || prefix.ends_with("PM"))
+			return "Japan";
+		if (prefix.ends_with("KA"))
+			return "Korea";
+		if (prefix.ends_with("AJ"))
+			return "Asia";
+		return {};
+	}
+
+	// Returns true if file_name belongs to the game identified by normalized_serial, i.e. it starts
+	// with the serial and the serial is not merely a prefix of a longer one.
+	bool PerGameMcd_NameMatchesSerial(const std::string_view file_name, const std::string_view normalized_serial)
+	{
+		const std::string_view title(Path::GetFileTitle(file_name));
+
+		// Consume the serial, ignoring whatever separators the name happens to use.
+		size_t pos = 0;
+		size_t matched = 0;
+		for (; pos < title.size() && matched < normalized_serial.size(); pos++)
+		{
+			const unsigned char ch = static_cast<unsigned char>(title[pos]);
+			if (!std::isalnum(ch))
+				continue;
+			if (static_cast<char>(std::toupper(ch)) != normalized_serial[matched])
+				return false;
+
+			matched++;
+		}
+
+		if (matched != normalized_serial.size())
+			return false;
+
+		// The boundary check runs on the original name, not the normalized one, otherwise a title
+		// starting with a digit ("SLES-53667 24 The Game") would look like a longer serial. What we
+		// actually want to reject is "SLES-5000" claiming "SLES-50001 Foo.bin".
+		return pos >= title.size() || !std::isalnum(static_cast<unsigned char>(title[pos]));
+	}
+
+	// .bin/.mc2 cards are stored without ECC data (the layout used by OPL and by real hardware
+	// dumps); everything else uses PCSX2's native layout, which includes ECC.
+	bool PerGameMcd_UsesRawLayout(const std::string_view name)
+	{
+		return name.ends_with(".bin") || name.ends_with(".mc2");
+	}
+
+	// Seeds a freshly created card from the template card configured in
+	// [MemoryCards]/PerGameCardsTemplate, so that new cards can start out already formatted.
+	bool PerGameMcd_CreateFromTemplate(const std::string& full_path, const std::string_view template_name)
+	{
+		if (template_name.empty())
+			return false;
+
+		const std::string template_path(Path::Combine(EmuFolders::MemoryCards, template_name));
+		if (FileSystem::GetPathFileSize(template_path.c_str()) <= 0)
+		{
+			Console.Warning("(FileMcd) Per-game card template '%s' does not exist, ignoring.", template_path.c_str());
+			return false;
+		}
+
+		// The template and the new card do not necessarily use the same on-disk layout, and copying
+		// one into the other verbatim would produce garbage once the ECC conversion runs on open.
+		const bool src_raw = PerGameMcd_UsesRawLayout(template_path);
+		const bool dst_raw = PerGameMcd_UsesRawLayout(full_path);
+
+		bool result;
+		if (src_raw == dst_raw)
+			result = FileSystem::CopyFilePath(template_path.c_str(), full_path.c_str(), false);
+		else if (src_raw)
+			result = ConvertNoECCtoRAW(template_path.c_str(), full_path.c_str());
+		else
+			result = ConvertRAWtoNoECC(template_path.c_str(), full_path.c_str());
+
+		if (!result)
+		{
+			Console.Warning("(FileMcd) Failed to create '%s' from per-game card template '%s'.",
+				full_path.c_str(), template_path.c_str());
+			FileSystem::DeleteFilePath(full_path.c_str());
+			return false;
+		}
+
+		Console.WriteLnFmt("(FileMcd) Created per-game memory card '{}' from template '{}'.",
+			Path::GetFileName(full_path), template_name);
+		return true;
+	}
+} // namespace
+
+std::string FileMcd_FindCardForSerial(const std::string_view serial)
+{
+	const std::string normalized_serial(PerGameMcd_NormalizeSerial(serial));
+	if (normalized_serial.empty())
+		return {};
+
+	FileSystem::FindResultsArray results;
+	FileSystem::FindFiles(EmuFolders::MemoryCards.c_str(), "*",
+		FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_FOLDERS | FILESYSTEM_FIND_RELATIVE_PATHS | FILESYSTEM_FIND_SORT_BY_NAME,
+		&results);
+
+	std::string best;
+	for (FILESYSTEM_FIND_DATA& fd : results)
+	{
+		const bool is_directory = (fd.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY) != 0;
+		if (is_directory)
+		{
+			if (!FileMcd_IsFolder(Path::Combine(EmuFolders::MemoryCards, fd.FileName)))
+				continue;
+		}
+		else if (!PerGameMcd_IsCardFileName(fd.FileName))
+		{
+			continue;
+		}
+
+		if (!PerGameMcd_NameMatchesSerial(fd.FileName, normalized_serial))
+			continue;
+
+		// An exact "SCES-50001.bin" wins over "SCES-50001 Some Title (Europe).bin".
+		if (PerGameMcd_NormalizeSerial(Path::GetFileTitle(fd.FileName)).size() == normalized_serial.size())
+			return std::move(fd.FileName);
+
+		if (best.empty())
+			best = std::move(fd.FileName);
+	}
+
+	return best;
+}
+
+std::string FileMcd_GetCardForSerial(const std::string_view serial, const std::string_view fallback_title,
+	const std::string_view extension_setting, const std::string_view template_card)
+{
+	const std::string normalized_serial(PerGameMcd_NormalizeSerial(serial));
+	if (normalized_serial.empty())
+		return {};
+
+	std::string existing(FileMcd_FindCardForSerial(serial));
+	if (!existing.empty())
+		return existing;
+
+	// Nothing matched, so build a name out of the serial, the title and the region.
+	std::string title(fallback_title);
+	if (const GameDatabaseSchema::GameEntry* game = GameDatabase::findGame(serial))
+		title = game->name;
+
+	const std::string_view region(PerGameMcd_GetRegionName(normalized_serial));
+	std::string extension(extension_setting.empty() ? std::string_view(".bin") : extension_setting);
+	if (extension.front() != '.')
+		extension.insert(extension.begin(), '.');
+
+	std::string name(serial);
+	if (!title.empty())
+		name += fmt::format(" {}", title);
+	if (!region.empty())
+		name += fmt::format(" ({})", region);
+	name = Path::SanitizeFileName(name);
+
+	// Leave room for the extension; some filesystems get unhappy past 255 bytes.
+	static constexpr size_t MAX_NAME_LENGTH = 200;
+	if (extension.size() < MAX_NAME_LENGTH && name.size() > (MAX_NAME_LENGTH - extension.size()))
+	{
+		name.erase(MAX_NAME_LENGTH - extension.size());
+
+		// GameDB titles are not ASCII, so don't leave half a UTF-8 sequence (or a trailing space) behind.
+		while (!name.empty() && (static_cast<u8>(name.back()) & 0xC0) == 0x80)
+			name.pop_back();
+		if (!name.empty() && (static_cast<u8>(name.back()) & 0x80) != 0)
+			name.pop_back();
+		while (!name.empty() && name.back() == ' ')
+			name.pop_back();
+	}
+	name += extension;
+
+	const std::string full_path(Path::Combine(EmuFolders::MemoryCards, name));
+	if (FileSystem::GetPathFileSize(full_path.c_str()) <= 0 && !PerGameMcd_CreateFromTemplate(full_path, template_card))
+	{
+		if (!FileMcd_CreateBlankCard(full_path, 8, PerGameMcd_UsesRawLayout(name)))
+		{
+			Host::ReportErrorAsync(TRANSLATE_SV("MemoryCard", "Memory Card Creation Failed"),
+				fmt::format(TRANSLATE_FS("MemoryCard", "Could not create the memory card:\n{}"), full_path));
+			return {};
+		}
+
+		Host::AddIconOSDMessage("PerGameMemoryCard", ICON_PF_MEMORY_CARD,
+			fmt::format(TRANSLATE_FS("MemoryCard", "Created memory card for this game:\n{}"), name),
+			Host::OSD_INFO_DURATION);
+	}
+
+	return name;
 }

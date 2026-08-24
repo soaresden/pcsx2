@@ -3626,6 +3626,10 @@ void FullscreenUI::DrawMemoryCardSettingsPage()
 	DrawFolderSetting(bsi, FSUI_ICONSTR(ICON_FA_FOLDER_OPEN, "Memory Card Directory"), "Folders", "MemoryCards", EmuFolders::MemoryCards);
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MAGNIFYING_GLASS, "Folder Memory Card Filter"),
 		FSUI_CSTR("Simulates a larger memory card by filtering saves only to the current game."), "EmuCore", "McdFolderAutoManage", true);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_PF_MEMORY_CARD, "Per-Game Memory Cards"),
+		FSUI_CSTR("Automatically inserts a memory card dedicated to the game being played into Slot 1, creating it if "
+				  "it does not exist yet."),
+		"MemoryCards", "PerGameCards", false);
 
 	if (MenuButton(FSUI_ICONSTR(ICON_FA_ARROWS_ROTATE, "Swap Memory Cards"), FSUI_CSTR("Swaps the selected memory cards in Slot 1 and Slot 2.")))
 	{
