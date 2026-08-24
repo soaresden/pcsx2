@@ -1298,18 +1298,19 @@ namespace
 	}
 } // namespace
 
-std::string FileMcd_FindCardForSerial(const std::string_view serial)
+std::vector<std::string> FileMcd_FindCardsForSerial(const std::string_view serial)
 {
+	std::vector<std::string> matches;
+
 	const std::string normalized_serial(PerGameMcd_NormalizeSerial(serial));
 	if (normalized_serial.empty())
-		return {};
+		return matches;
 
 	FileSystem::FindResultsArray results;
 	FileSystem::FindFiles(EmuFolders::MemoryCards.c_str(), "*",
 		FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_FOLDERS | FILESYSTEM_FIND_RELATIVE_PATHS | FILESYSTEM_FIND_SORT_BY_NAME,
 		&results);
 
-	std::string best;
 	for (FILESYSTEM_FIND_DATA& fd : results)
 	{
 		const bool is_directory = (fd.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -1326,27 +1327,58 @@ std::string FileMcd_FindCardForSerial(const std::string_view serial)
 		if (!PerGameMcd_NameMatchesSerial(fd.FileName, normalized_serial))
 			continue;
 
-		// An exact "SCES-50001.bin" wins over "SCES-50001 Some Title (Europe).bin".
+		// An exact "SCES-50001.bin" goes first, ahead of "SCES-50001 Some Title (Europe).bin".
 		if (PerGameMcd_NormalizeSerial(Path::GetFileTitle(fd.FileName)).size() == normalized_serial.size())
-			return std::move(fd.FileName);
-
-		if (best.empty())
-			best = std::move(fd.FileName);
+			matches.insert(matches.begin(), std::move(fd.FileName));
+		else
+			matches.push_back(std::move(fd.FileName));
 	}
 
-	return best;
+	return matches;
 }
 
 std::string FileMcd_GetCardForSerial(const std::string_view serial, const std::string_view fallback_title,
-	const std::string_view extension_setting, const std::string_view template_card)
+	const std::string_view extension_setting, const std::string_view template_card,
+	const std::string_view preferred_card)
 {
 	const std::string normalized_serial(PerGameMcd_NormalizeSerial(serial));
 	if (normalized_serial.empty())
 		return {};
 
-	std::string existing(FileMcd_FindCardForSerial(serial));
-	if (!existing.empty())
-		return existing;
+	const std::vector<std::string> matches(FileMcd_FindCardsForSerial(serial));
+	if (!matches.empty())
+	{
+		// The user picked one of them at some point, and it is still there.
+		size_t index = 0;
+		if (!preferred_card.empty())
+		{
+			for (size_t i = 0; i < matches.size(); i++)
+			{
+				if (matches[i] == preferred_card)
+				{
+					index = i;
+					break;
+				}
+			}
+		}
+
+		const std::string& chosen = matches[index];
+		if (matches.size() > 1)
+		{
+			Host::AddIconOSDMessage("PerGameMemoryCard", ICON_PF_MEMORY_CARD,
+				fmt::format(TRANSLATE_FS("MemoryCard", "Memory card for this game:\n{0}\n(card {1} of {2} matching this game)"),
+					chosen, index + 1, matches.size()),
+				Host::OSD_INFO_DURATION);
+		}
+		else
+		{
+			Host::AddIconOSDMessage("PerGameMemoryCard", ICON_PF_MEMORY_CARD,
+				fmt::format(TRANSLATE_FS("MemoryCard", "Memory card for this game:\n{}"), chosen),
+				Host::OSD_INFO_DURATION);
+		}
+
+		return chosen;
+	}
 
 	// Nothing matched, so build a name out of the serial, the title and the region.
 	std::string title(fallback_title);

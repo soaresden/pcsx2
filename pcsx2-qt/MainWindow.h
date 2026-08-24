@@ -276,6 +276,8 @@ private:
 
 	bool shouldAbortForMemcardBusy(const VMLock& lock);
 
+	void promptForPerGameMemoryCard(const QString& serial);
+
 	QWidget* getContentParent();
 	void saveDisplayWindowGeometryToConfig();
 	void restoreDisplayWindowGeometryFromConfig();

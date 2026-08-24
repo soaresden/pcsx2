@@ -179,6 +179,7 @@ static u32 s_current_crc;
 static std::string s_per_game_memcard_serial;
 static std::string s_per_game_memcard_extension;
 static std::string s_per_game_memcard_template;
+static std::string s_per_game_memcard_preferred;
 static std::string s_per_game_memcard_name;
 static u32 s_elf_entry_point = 0xFFFFFFFFu;
 static std::string s_elf_path;
@@ -705,16 +706,25 @@ void VMManager::ApplyPerGameMemoryCard(SettingsInterface& si)
 	std::string extension(si.GetStringValue("MemoryCards", "PerGameCardsExtension", ".bin"));
 	std::string template_card(si.GetStringValue("MemoryCards", "PerGameCardsTemplate", ""));
 
-	// Resolving hits the filesystem and can create a card, so only redo it when something that
-	// feeds into the result actually changed.
+	// When several cards match a game, the frontend asks which one to use and stores the answer
+	// here, keyed by serial.
+	std::string preferred_card(si.GetStringValue("PerGameCards", serial.c_str(), ""));
+
+	// Resolving hits the filesystem, can create a card and puts a message on screen, so only redo it
+	// when something that feeds into the result actually changed.
 	if (s_per_game_memcard_serial != serial || s_per_game_memcard_extension != extension ||
-		s_per_game_memcard_template != template_card)
+		s_per_game_memcard_template != template_card || s_per_game_memcard_preferred != preferred_card)
 	{
 		s_per_game_memcard_serial = serial;
 		s_per_game_memcard_extension = std::move(extension);
 		s_per_game_memcard_template = std::move(template_card);
-		s_per_game_memcard_name = FileMcd_GetCardForSerial(
-			serial, title, s_per_game_memcard_extension, s_per_game_memcard_template);
+		s_per_game_memcard_preferred = std::move(preferred_card);
+
+		std::string name(FileMcd_GetCardForSerial(serial, title, s_per_game_memcard_extension,
+			s_per_game_memcard_template, s_per_game_memcard_preferred));
+
+		std::unique_lock lock(s_info_mutex);
+		s_per_game_memcard_name = std::move(name);
 	}
 
 	if (s_per_game_memcard_name.empty())
@@ -722,6 +732,12 @@ void VMManager::ApplyPerGameMemoryCard(SettingsInterface& si)
 
 	// Slot1_Enable is left alone on purpose: if the user turned slot 1 off, they want it off.
 	EmuConfig.Mcd[0].Filename = s_per_game_memcard_name;
+}
+
+std::string VMManager::GetPerGameMemoryCard()
+{
+	std::unique_lock lock(s_info_mutex);
+	return s_per_game_memcard_name;
 }
 
 void VMManager::LoadInputBindings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
@@ -1223,7 +1239,12 @@ void VMManager::ClearDiscDetails()
 	s_per_game_memcard_serial = {};
 	s_per_game_memcard_extension = {};
 	s_per_game_memcard_template = {};
-	s_per_game_memcard_name = {};
+	s_per_game_memcard_preferred = {};
+
+	{
+		std::unique_lock lock(s_info_mutex);
+		s_per_game_memcard_name = {};
+	}
 
 	std::unique_lock lock(s_info_mutex);
 	s_disc_crc = 0;

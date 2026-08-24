@@ -42,6 +42,7 @@
 #include "pcsx2/Recording/InputRecording.h"
 #include "pcsx2/Recording/InputRecordingControls.h"
 #include "pcsx2/SaveState.h"
+#include "pcsx2/SIO/Memcard/MemoryCardFile.h"
 #include "pcsx2/SIO/Sio.h"
 #include "pcsx2/GS/GSExtra.h"
 
@@ -2530,6 +2531,54 @@ void MainWindow::onGameChanged(const QString& title, const QString& elf_override
 	s_current_running_crc = crc;
 	updateWindowTitle();
 	updateGameDependentActions();
+
+	promptForPerGameMemoryCard(serial);
+}
+
+// With per-game memory cards enabled, a game can have more than one card in the memory cards
+// directory (e.g. one per playthrough). We mount the first one and ask here which it should really
+// be; the answer is remembered per serial, so this only comes up once per game.
+void MainWindow::promptForPerGameMemoryCard(const QString& serial)
+{
+	if (serial.isEmpty())
+		return;
+
+	// Empty means the feature is off, or nothing has been resolved for this game.
+	if (VMManager::GetPerGameMemoryCard().empty())
+		return;
+
+	// Don't ask twice for the same game, and don't throw a modal over a fullscreen session.
+	static QString s_last_prompted_serial;
+	if (serial == s_last_prompted_serial || !isVisible() || isRenderingFullscreen())
+		return;
+
+	const std::string serial_str(serial.toStdString());
+	if (!Host::GetBaseStringSettingValue("PerGameCards", serial_str.c_str()).empty())
+		return;
+
+	const std::vector<std::string> matches(FileMcd_FindCardsForSerial(serial_str));
+	if (matches.size() < 2)
+		return;
+
+	s_last_prompted_serial = serial;
+
+	QStringList items;
+	items.reserve(static_cast<qsizetype>(matches.size()));
+	for (const std::string& match : matches)
+		items.append(QString::fromStdString(match));
+
+	bool accepted = false;
+	const QString chosen = QInputDialog::getItem(this, tr("Per-Game Memory Card"),
+		tr("%1 memory cards match %2.\n\nWhich one should be used for this game?")
+			.arg(static_cast<int>(matches.size()))
+			.arg(serial),
+		items, 0, false, &accepted);
+	if (!accepted || chosen.isEmpty())
+		return;
+
+	Host::SetBaseStringSettingValue("PerGameCards", serial_str.c_str(), chosen.toUtf8().constData());
+	Host::CommitBaseSettingChanges();
+	g_emu_thread->applySettings();
 }
 
 void MainWindow::showEvent(QShowEvent* event)

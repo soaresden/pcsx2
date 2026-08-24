@@ -92,6 +92,10 @@ namespace VMManager
 	/// Returns the serial of the disc currently running.
 	std::string GetDiscSerial();
 
+	/// Returns the memory card that per-game memory cards picked for the running game, or an empty
+	/// string when the option is off or no game is running. Safe to call from any thread.
+	std::string GetPerGameMemoryCard();
+
 	/// Returns the path of the main ELF of the disc currently running.
 	std::string GetDiscELF();
 

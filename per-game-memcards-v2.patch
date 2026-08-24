@@ -1,0 +1,321 @@
+--- a/pcsx2/SIO/Memcard/MemoryCardFile.h
++++ b/pcsx2/SIO/Memcard/MemoryCardFile.h
+@@ -65,15 +65,18 @@
+ /// the card is written in the raw layout used by .bin/.mc2 cards, otherwise PCSX2's native layout.
+ bool FileMcd_CreateBlankCard(const std::string& path, uint size_in_mb, bool no_ecc);
+ 
+-/// Returns the name of the existing memory card in the memory cards directory belonging to the
+-/// specified game serial, or an empty string when there is none. Matching is done on the start of
+-/// the file name, so third-party naming schemes such as "SCES-50001 Tekken Tag (Europe).bin" work.
+-std::string FileMcd_FindCardForSerial(const std::string_view serial);
++/// Returns every memory card in the memory cards directory belonging to the specified game serial,
++/// best match first. Matching is done on the start of the file name, so third-party naming schemes
++/// such as "SCES-50001 Tekken Tag (Europe).bin" work.
++std::vector<std::string> FileMcd_FindCardsForSerial(const std::string_view serial);
+ 
+-/// Same as FileMcd_FindCardForSerial(), but creates the card when it does not exist yet. The new
+-/// card is named after the serial, the GameDB title (falling back to fallback_title) and the region,
+-/// with the specified extension. When template_card names an existing card, it is copied instead of
+-/// writing a blank card, which allows new cards to start out already formatted.
++/// Returns the memory card which should be used for the specified game serial, creating it when
++/// none exists yet. The new card is named after the serial, the GameDB title (falling back to
++/// fallback_title) and the region, with the specified extension. When template_card names an
++/// existing card, it is copied instead of writing a blank card, which allows new cards to start out
++/// already formatted. preferred_card, when it is one of the cards belonging to this game, wins over
++/// the automatic pick - that is how the user's choice between several matching cards is honoured.
+ /// Note: this must not query the settings itself, it is called while the settings lock is held.
+ std::string FileMcd_GetCardForSerial(const std::string_view serial, const std::string_view fallback_title,
+-	const std::string_view extension, const std::string_view template_card);
+\ No newline at end of file
++	const std::string_view extension, const std::string_view template_card,
++	const std::string_view preferred_card);
+\ No newline at end of file
+--- a/pcsx2/SIO/Memcard/MemoryCardFile.cpp
++++ b/pcsx2/SIO/Memcard/MemoryCardFile.cpp
+@@ -1298,18 +1298,19 @@
+ 	}
+ } // namespace
+ 
+-std::string FileMcd_FindCardForSerial(const std::string_view serial)
++std::vector<std::string> FileMcd_FindCardsForSerial(const std::string_view serial)
+ {
++	std::vector<std::string> matches;
++
+ 	const std::string normalized_serial(PerGameMcd_NormalizeSerial(serial));
+ 	if (normalized_serial.empty())
+-		return {};
++		return matches;
+ 
+ 	FileSystem::FindResultsArray results;
+ 	FileSystem::FindFiles(EmuFolders::MemoryCards.c_str(), "*",
+ 		FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_FOLDERS | FILESYSTEM_FIND_RELATIVE_PATHS | FILESYSTEM_FIND_SORT_BY_NAME,
+ 		&results);
+ 
+-	std::string best;
+ 	for (FILESYSTEM_FIND_DATA& fd : results)
+ 	{
+ 		const bool is_directory = (fd.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY) != 0;
+@@ -1326,27 +1327,58 @@
+ 		if (!PerGameMcd_NameMatchesSerial(fd.FileName, normalized_serial))
+ 			continue;
+ 
+-		// An exact "SCES-50001.bin" wins over "SCES-50001 Some Title (Europe).bin".
++		// An exact "SCES-50001.bin" goes first, ahead of "SCES-50001 Some Title (Europe).bin".
+ 		if (PerGameMcd_NormalizeSerial(Path::GetFileTitle(fd.FileName)).size() == normalized_serial.size())
+-			return std::move(fd.FileName);
+-
+-		if (best.empty())
+-			best = std::move(fd.FileName);
++			matches.insert(matches.begin(), std::move(fd.FileName));
++		else
++			matches.push_back(std::move(fd.FileName));
+ 	}
+ 
+-	return best;
++	return matches;
+ }
+ 
+ std::string FileMcd_GetCardForSerial(const std::string_view serial, const std::string_view fallback_title,
+-	const std::string_view extension_setting, const std::string_view template_card)
++	const std::string_view extension_setting, const std::string_view template_card,
++	const std::string_view preferred_card)
+ {
+ 	const std::string normalized_serial(PerGameMcd_NormalizeSerial(serial));
+ 	if (normalized_serial.empty())
+ 		return {};
+ 
+-	std::string existing(FileMcd_FindCardForSerial(serial));
+-	if (!existing.empty())
+-		return existing;
++	const std::vector<std::string> matches(FileMcd_FindCardsForSerial(serial));
++	if (!matches.empty())
++	{
++		// The user picked one of them at some point, and it is still there.
++		size_t index = 0;
++		if (!preferred_card.empty())
++		{
++			for (size_t i = 0; i < matches.size(); i++)
++			{
++				if (matches[i] == preferred_card)
++				{
++					index = i;
++					break;
++				}
++			}
++		}
++
++		const std::string& chosen = matches[index];
++		if (matches.size() > 1)
++		{
++			Host::AddIconOSDMessage("PerGameMemoryCard", ICON_PF_MEMORY_CARD,
++				fmt::format(TRANSLATE_FS("MemoryCard", "Memory card for this game:\n{0}\n(card {1} of {2} matching this game)"),
++					chosen, index + 1, matches.size()),
++				Host::OSD_INFO_DURATION);
++		}
++		else
++		{
++			Host::AddIconOSDMessage("PerGameMemoryCard", ICON_PF_MEMORY_CARD,
++				fmt::format(TRANSLATE_FS("MemoryCard", "Memory card for this game:\n{}"), chosen),
++				Host::OSD_INFO_DURATION);
++		}
++
++		return chosen;
++	}
+ 
+ 	// Nothing matched, so build a name out of the serial, the title and the region.
+ 	std::string title(fallback_title);
+--- a/pcsx2/VMManager.h
++++ b/pcsx2/VMManager.h
+@@ -92,6 +92,10 @@
+ 	/// Returns the serial of the disc currently running.
+ 	std::string GetDiscSerial();
+ 
++	/// Returns the memory card that per-game memory cards picked for the running game, or an empty
++	/// string when the option is off or no game is running. Safe to call from any thread.
++	std::string GetPerGameMemoryCard();
++
+ 	/// Returns the path of the main ELF of the disc currently running.
+ 	std::string GetDiscELF();
+ 
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -179,6 +179,7 @@
+ static std::string s_per_game_memcard_serial;
+ static std::string s_per_game_memcard_extension;
+ static std::string s_per_game_memcard_template;
++static std::string s_per_game_memcard_preferred;
+ static std::string s_per_game_memcard_name;
+ static u32 s_elf_entry_point = 0xFFFFFFFFu;
+ static std::string s_elf_path;
+@@ -705,16 +706,25 @@
+ 	std::string extension(si.GetStringValue("MemoryCards", "PerGameCardsExtension", ".bin"));
+ 	std::string template_card(si.GetStringValue("MemoryCards", "PerGameCardsTemplate", ""));
+ 
+-	// Resolving hits the filesystem and can create a card, so only redo it when something that
+-	// feeds into the result actually changed.
++	// When several cards match a game, the frontend asks which one to use and stores the answer
++	// here, keyed by serial.
++	std::string preferred_card(si.GetStringValue("PerGameCards", serial.c_str(), ""));
++
++	// Resolving hits the filesystem, can create a card and puts a message on screen, so only redo it
++	// when something that feeds into the result actually changed.
+ 	if (s_per_game_memcard_serial != serial || s_per_game_memcard_extension != extension ||
+-		s_per_game_memcard_template != template_card)
++		s_per_game_memcard_template != template_card || s_per_game_memcard_preferred != preferred_card)
+ 	{
+ 		s_per_game_memcard_serial = serial;
+ 		s_per_game_memcard_extension = std::move(extension);
+ 		s_per_game_memcard_template = std::move(template_card);
+-		s_per_game_memcard_name = FileMcd_GetCardForSerial(
+-			serial, title, s_per_game_memcard_extension, s_per_game_memcard_template);
++		s_per_game_memcard_preferred = std::move(preferred_card);
++
++		std::string name(FileMcd_GetCardForSerial(serial, title, s_per_game_memcard_extension,
++			s_per_game_memcard_template, s_per_game_memcard_preferred));
++
++		std::unique_lock lock(s_info_mutex);
++		s_per_game_memcard_name = std::move(name);
+ 	}
+ 
+ 	if (s_per_game_memcard_name.empty())
+@@ -724,6 +734,12 @@
+ 	EmuConfig.Mcd[0].Filename = s_per_game_memcard_name;
+ }
+ 
++std::string VMManager::GetPerGameMemoryCard()
++{
++	std::unique_lock lock(s_info_mutex);
++	return s_per_game_memcard_name;
++}
++
+ void VMManager::LoadInputBindings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
+ {
+ 	// Hotkeys use the base configuration, except if the custom hotkeys option is enabled.
+@@ -1223,7 +1239,12 @@
+ 	s_per_game_memcard_serial = {};
+ 	s_per_game_memcard_extension = {};
+ 	s_per_game_memcard_template = {};
+-	s_per_game_memcard_name = {};
++	s_per_game_memcard_preferred = {};
++
++	{
++		std::unique_lock lock(s_info_mutex);
++		s_per_game_memcard_name = {};
++	}
+ 
+ 	std::unique_lock lock(s_info_mutex);
+ 	s_disc_crc = 0;
+--- a/pcsx2-qt/MainWindow.h
++++ b/pcsx2-qt/MainWindow.h
+@@ -276,6 +276,8 @@
+ 
+ 	bool shouldAbortForMemcardBusy(const VMLock& lock);
+ 
++	void promptForPerGameMemoryCard(const QString& serial);
++
+ 	QWidget* getContentParent();
+ 	void saveDisplayWindowGeometryToConfig();
+ 	void restoreDisplayWindowGeometryFromConfig();
+--- a/pcsx2-qt/MainWindow.cpp
++++ b/pcsx2-qt/MainWindow.cpp
+@@ -42,6 +42,7 @@
+ #include "pcsx2/Recording/InputRecording.h"
+ #include "pcsx2/Recording/InputRecordingControls.h"
+ #include "pcsx2/SaveState.h"
++#include "pcsx2/SIO/Memcard/MemoryCardFile.h"
+ #include "pcsx2/SIO/Sio.h"
+ #include "pcsx2/GS/GSExtra.h"
+ 
+@@ -2530,6 +2531,54 @@
+ 	s_current_running_crc = crc;
+ 	updateWindowTitle();
+ 	updateGameDependentActions();
++
++	promptForPerGameMemoryCard(serial);
++}
++
++// With per-game memory cards enabled, a game can have more than one card in the memory cards
++// directory (e.g. one per playthrough). We mount the first one and ask here which it should really
++// be; the answer is remembered per serial, so this only comes up once per game.
++void MainWindow::promptForPerGameMemoryCard(const QString& serial)
++{
++	if (serial.isEmpty())
++		return;
++
++	// Empty means the feature is off, or nothing has been resolved for this game.
++	if (VMManager::GetPerGameMemoryCard().empty())
++		return;
++
++	// Don't ask twice for the same game, and don't throw a modal over a fullscreen session.
++	static QString s_last_prompted_serial;
++	if (serial == s_last_prompted_serial || !isVisible() || isRenderingFullscreen())
++		return;
++
++	const std::string serial_str(serial.toStdString());
++	if (!Host::GetBaseStringSettingValue("PerGameCards", serial_str.c_str()).empty())
++		return;
++
++	const std::vector<std::string> matches(FileMcd_FindCardsForSerial(serial_str));
++	if (matches.size() < 2)
++		return;
++
++	s_last_prompted_serial = serial;
++
++	QStringList items;
++	items.reserve(static_cast<qsizetype>(matches.size()));
++	for (const std::string& match : matches)
++		items.append(QString::fromStdString(match));
++
++	bool accepted = false;
++	const QString chosen = QInputDialog::getItem(this, tr("Per-Game Memory Card"),
++		tr("%1 memory cards match %2.\n\nWhich one should be used for this game?")
++			.arg(static_cast<int>(matches.size()))
++			.arg(serial),
++		items, 0, false, &accepted);
++	if (!accepted || chosen.isEmpty())
++		return;
++
++	Host::SetBaseStringSettingValue("PerGameCards", serial_str.c_str(), chosen.toUtf8().constData());
++	Host::CommitBaseSettingChanges();
++	g_emu_thread->applySettings();
+ }
+ 
+ void MainWindow::showEvent(QShowEvent* event)
+--- a/pcsx2-qt/Settings/MemoryCardSettingsWidget.cpp
++++ b/pcsx2-qt/Settings/MemoryCardSettingsWidget.cpp
+@@ -19,6 +19,7 @@
+ #include "SettingsWindow.h"
+ 
+ #include "pcsx2/SIO/Memcard/MemoryCardFile.h"
++#include "pcsx2/VMManager.h"
+ 
+ static constexpr const char* CONFIG_SECTION = "MemoryCards";
+ 
+@@ -346,13 +347,25 @@
+ {
+ 	const bool perGame = dialog()->isPerGameSettings();
+ 
++	// Slot 1 doesn't hold what the settings say when per-game cards are on and a game is running -
++	// show what is actually inserted instead of a stale (or empty) configured value.
++	const std::string autoCard(dialog()->getEffectiveBoolValue(CONFIG_SECTION, "PerGameCards", false) ?
++								   VMManager::GetPerGameMemoryCard() :
++								   std::string());
++
+ 	for (u32 slot = 0; slot < static_cast<u32>(m_slots.size()); slot++)
+ 	{
+ 		const bool enabled = m_slots[slot].enable->isChecked();
+ 		const std::string slotKey = getSlotFilenameKey(slot);
+-		const std::optional<std::string> name(
++		std::optional<std::string> name(
+ 			dialog()->getEffectiveStringValue(CONFIG_SECTION, slotKey.c_str(), FileMcd_GetDefaultName(slot).c_str()));
+-		const bool inherited = perGame ? !dialog()->containsSettingValue(CONFIG_SECTION, slotKey.c_str()) : false;
++		bool inherited = perGame ? !dialog()->containsSettingValue(CONFIG_SECTION, slotKey.c_str()) : false;
++
++		if (slot == 0 && !autoCard.empty())
++		{
++			name = autoCard;
++			inherited = true; // renders italic/greyed, i.e. "not what you configured"
++		}
+ 
+ 		m_slots[slot].slot->setCard(name, inherited);
+ 		m_slots[slot].slot->setEnabled(enabled);

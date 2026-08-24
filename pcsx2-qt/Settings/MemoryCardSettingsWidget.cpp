@@ -19,6 +19,7 @@
 #include "SettingsWindow.h"
 
 #include "pcsx2/SIO/Memcard/MemoryCardFile.h"
+#include "pcsx2/VMManager.h"
 
 static constexpr const char* CONFIG_SECTION = "MemoryCards";
 
@@ -346,13 +347,25 @@ void MemoryCardSettingsWidget::refresh()
 {
 	const bool perGame = dialog()->isPerGameSettings();
 
+	// Slot 1 doesn't hold what the settings say when per-game cards are on and a game is running -
+	// show what is actually inserted instead of a stale (or empty) configured value.
+	const std::string autoCard(dialog()->getEffectiveBoolValue(CONFIG_SECTION, "PerGameCards", false) ?
+								   VMManager::GetPerGameMemoryCard() :
+								   std::string());
+
 	for (u32 slot = 0; slot < static_cast<u32>(m_slots.size()); slot++)
 	{
 		const bool enabled = m_slots[slot].enable->isChecked();
 		const std::string slotKey = getSlotFilenameKey(slot);
-		const std::optional<std::string> name(
+		std::optional<std::string> name(
 			dialog()->getEffectiveStringValue(CONFIG_SECTION, slotKey.c_str(), FileMcd_GetDefaultName(slot).c_str()));
-		const bool inherited = perGame ? !dialog()->containsSettingValue(CONFIG_SECTION, slotKey.c_str()) : false;
+		bool inherited = perGame ? !dialog()->containsSettingValue(CONFIG_SECTION, slotKey.c_str()) : false;
+
+		if (slot == 0 && !autoCard.empty())
+		{
+			name = autoCard;
+			inherited = true; // renders italic/greyed, i.e. "not what you configured"
+		}
 
 		m_slots[slot].slot->setCard(name, inherited);
 		m_slots[slot].slot->setEnabled(enabled);

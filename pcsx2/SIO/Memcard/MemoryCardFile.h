@@ -65,15 +65,18 @@ bool FileMcd_DeleteCard(const std::string_view name);
 /// the card is written in the raw layout used by .bin/.mc2 cards, otherwise PCSX2's native layout.
 bool FileMcd_CreateBlankCard(const std::string& path, uint size_in_mb, bool no_ecc);
 
-/// Returns the name of the existing memory card in the memory cards directory belonging to the
-/// specified game serial, or an empty string when there is none. Matching is done on the start of
-/// the file name, so third-party naming schemes such as "SCES-50001 Tekken Tag (Europe).bin" work.
-std::string FileMcd_FindCardForSerial(const std::string_view serial);
+/// Returns every memory card in the memory cards directory belonging to the specified game serial,
+/// best match first. Matching is done on the start of the file name, so third-party naming schemes
+/// such as "SCES-50001 Tekken Tag (Europe).bin" work.
+std::vector<std::string> FileMcd_FindCardsForSerial(const std::string_view serial);
 
-/// Same as FileMcd_FindCardForSerial(), but creates the card when it does not exist yet. The new
-/// card is named after the serial, the GameDB title (falling back to fallback_title) and the region,
-/// with the specified extension. When template_card names an existing card, it is copied instead of
-/// writing a blank card, which allows new cards to start out already formatted.
+/// Returns the memory card which should be used for the specified game serial, creating it when
+/// none exists yet. The new card is named after the serial, the GameDB title (falling back to
+/// fallback_title) and the region, with the specified extension. When template_card names an
+/// existing card, it is copied instead of writing a blank card, which allows new cards to start out
+/// already formatted. preferred_card, when it is one of the cards belonging to this game, wins over
+/// the automatic pick - that is how the user's choice between several matching cards is honoured.
 /// Note: this must not query the settings itself, it is called while the settings lock is held.
 std::string FileMcd_GetCardForSerial(const std::string_view serial, const std::string_view fallback_title,
-	const std::string_view extension, const std::string_view template_card);
+	const std::string_view extension, const std::string_view template_card,
+	const std::string_view preferred_card);
