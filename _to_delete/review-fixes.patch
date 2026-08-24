@@ -1,0 +1,193 @@
+--- a/pcsx2/SIO/Memcard/MemoryCardFile.cpp
++++ b/pcsx2/SIO/Memcard/MemoryCardFile.cpp
+@@ -389,7 +389,7 @@
+ 	if (!fp)
+ 		return false;
+ 
+-	// A megabyte of card data is 1024 sectors; with ECC each sector is 528 bytes instead of 512.
++	// A megabyte of card data is 2048 sectors; with ECC each sector is 528 bytes instead of 512.
+ 	const u64 total_size = static_cast<u64>(size_in_mb) * (no_ecc ? (1024 * 512 * 2) : MC2_MBSIZE);
+ 
+ 	u8 buf[MC2_ERASE_SIZE];
+@@ -680,6 +680,16 @@
+ 		return;
+ 	}
+ 
++	// Slot 1 is owned by the per-game override, and would be put straight back on the next
++	// settings reload - leaving both slots pointing at the same file.
++	if (Host::GetBoolSettingValue("MemoryCards", "PerGameCards", false))
++	{
++		Host::AddIconOSDMessage("MemoryCardSwap_PerGame", ICON_PF_MEMORY_CARD,
++			TRANSLATE_SV("MemoryCardSwap_PerGame",
++				"Can't swap memory cards while per-game memory cards are enabled."));
++		return;
++	}
++
+ 	// Check if auto-eject is active
+ 	if (FileMcd_IsAutoEjecting())
+ 	{
+@@ -1185,8 +1195,9 @@
+ 
+ 	bool PerGameMcd_IsCardFileName(const std::string_view name)
+ 	{
++		// Keep in sync with FileMcd_GetAvailableCards().
+ 		return name.ends_with(".ps2") || name.ends_with(".bin") || name.ends_with(".mc2") ||
+-			   name.ends_with(".mcd") || name.ends_with(".mcr") || name.ends_with(".srm");
++			   name.ends_with(".mcd") || name.ends_with(".mcr");
+ 	}
+ 
+ 	// Region label used when creating a new card. Derived from the serial prefix, which is more
+@@ -1214,13 +1225,36 @@
+ 	// with the serial and the serial is not merely a prefix of a longer one.
+ 	bool PerGameMcd_NameMatchesSerial(const std::string_view file_name, const std::string_view normalized_serial)
+ 	{
+-		const std::string normalized_name = PerGameMcd_NormalizeSerial(Path::GetFileTitle(file_name));
+-		if (!normalized_name.starts_with(normalized_serial))
++		const std::string_view title(Path::GetFileTitle(file_name));
++
++		// Consume the serial, ignoring whatever separators the name happens to use.
++		size_t pos = 0;
++		size_t matched = 0;
++		for (; pos < title.size() && matched < normalized_serial.size(); pos++)
++		{
++			const unsigned char ch = static_cast<unsigned char>(title[pos]);
++			if (!std::isalnum(ch))
++				continue;
++			if (static_cast<char>(std::toupper(ch)) != normalized_serial[matched])
++				return false;
++
++			matched++;
++		}
++
++		if (matched != normalized_serial.size())
+ 			return false;
+ 
+-		// "SLES-5000" must not claim "SLES-50001 Foo.bin".
+-		return normalized_name.size() == normalized_serial.size() ||
+-			   !std::isdigit(static_cast<unsigned char>(normalized_name[normalized_serial.size()]));
++		// The boundary check runs on the original name, not the normalized one, otherwise a title
++		// starting with a digit ("SLES-53667 24 The Game") would look like a longer serial. What we
++		// actually want to reject is "SLES-5000" claiming "SLES-50001 Foo.bin".
++		return pos >= title.size() || !std::isalnum(static_cast<unsigned char>(title[pos]));
++	}
++
++	// .bin/.mc2 cards are stored without ECC data (the layout used by OPL and by real hardware
++	// dumps); everything else uses PCSX2's native layout, which includes ECC.
++	bool PerGameMcd_UsesRawLayout(const std::string_view name)
++	{
++		return name.ends_with(".bin") || name.ends_with(".mc2");
+ 	}
+ 
+ 	// Seeds a freshly created card from the template card configured in
+@@ -1237,9 +1271,24 @@
+ 			return false;
+ 		}
+ 
+-		if (!FileSystem::CopyFilePath(template_path.c_str(), full_path.c_str(), false))
++		// The template and the new card do not necessarily use the same on-disk layout, and copying
++		// one into the other verbatim would produce garbage once the ECC conversion runs on open.
++		const bool src_raw = PerGameMcd_UsesRawLayout(template_path);
++		const bool dst_raw = PerGameMcd_UsesRawLayout(full_path);
++
++		bool result;
++		if (src_raw == dst_raw)
++			result = FileSystem::CopyFilePath(template_path.c_str(), full_path.c_str(), false);
++		else if (src_raw)
++			result = ConvertNoECCtoRAW(template_path.c_str(), full_path.c_str());
++		else
++			result = ConvertRAWtoNoECC(template_path.c_str(), full_path.c_str());
++
++		if (!result)
+ 		{
+-			Console.Warning("(FileMcd) Failed to copy per-game card template '%s'.", template_path.c_str());
++			Console.Warning("(FileMcd) Failed to create '%s' from per-game card template '%s'.",
++				full_path.c_str(), template_path.c_str());
++			FileSystem::DeleteFilePath(full_path.c_str());
+ 			return false;
+ 		}
+ 
+@@ -1319,16 +1368,23 @@
+ 	// Leave room for the extension; some filesystems get unhappy past 255 bytes.
+ 	static constexpr size_t MAX_NAME_LENGTH = 200;
+ 	if (extension.size() < MAX_NAME_LENGTH && name.size() > (MAX_NAME_LENGTH - extension.size()))
++	{
+ 		name.erase(MAX_NAME_LENGTH - extension.size());
++
++		// GameDB titles are not ASCII, so don't leave half a UTF-8 sequence (or a trailing space) behind.
++		while (!name.empty() && (static_cast<u8>(name.back()) & 0xC0) == 0x80)
++			name.pop_back();
++		if (!name.empty() && (static_cast<u8>(name.back()) & 0x80) != 0)
++			name.pop_back();
++		while (!name.empty() && name.back() == ' ')
++			name.pop_back();
++	}
+ 	name += extension;
+ 
+ 	const std::string full_path(Path::Combine(EmuFolders::MemoryCards, name));
+ 	if (FileSystem::GetPathFileSize(full_path.c_str()) <= 0 && !PerGameMcd_CreateFromTemplate(full_path, template_card))
+ 	{
+-		// Cards ending in .bin/.mc2 are stored without ECC data (the format used by OPL and by real
+-		// hardware dumps); everything else gets PCSX2's native ECC layout.
+-		const bool no_ecc = name.ends_with(".bin") || name.ends_with(".mc2");
+-		if (!FileMcd_CreateBlankCard(full_path, 8, no_ecc))
++		if (!FileMcd_CreateBlankCard(full_path, 8, PerGameMcd_UsesRawLayout(name)))
+ 		{
+ 			Host::ReportErrorAsync(TRANSLATE_SV("MemoryCard", "Memory Card Creation Failed"),
+ 				fmt::format(TRANSLATE_FS("MemoryCard", "Could not create the memory card:\n{}"), full_path));
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -177,6 +177,8 @@
+ 
+ // Cache for the per-game memory card, so we only touch the filesystem when the game changes.
+ static std::string s_per_game_memcard_serial;
++static std::string s_per_game_memcard_extension;
++static std::string s_per_game_memcard_template;
+ static std::string s_per_game_memcard_name;
+ static u32 s_elf_entry_point = 0xFFFFFFFFu;
+ static std::string s_elf_path;
+@@ -698,22 +700,28 @@
+ 		title = s_title;
+ 	}
+ 
+-	if (s_per_game_memcard_serial != serial)
++	// NOTE: We're called with the settings lock held, so everything the resolver needs has to be
++	// read from si here, rather than through the Host::Get*SettingValue() helpers.
++	std::string extension(si.GetStringValue("MemoryCards", "PerGameCardsExtension", ".bin"));
++	std::string template_card(si.GetStringValue("MemoryCards", "PerGameCardsTemplate", ""));
++
++	// Resolving hits the filesystem and can create a card, so only redo it when something that
++	// feeds into the result actually changed.
++	if (s_per_game_memcard_serial != serial || s_per_game_memcard_extension != extension ||
++		s_per_game_memcard_template != template_card)
+ 	{
+-		// NOTE: We're called with the settings lock held, so everything the resolver needs has to be
+-		// read from si here, rather than through the Host::Get*SettingValue() helpers.
+-		const std::string extension(si.GetStringValue("MemoryCards", "PerGameCardsExtension", ".bin"));
+-		const std::string template_card(si.GetStringValue("MemoryCards", "PerGameCardsTemplate", ""));
+-
+ 		s_per_game_memcard_serial = serial;
+-		s_per_game_memcard_name = FileMcd_GetCardForSerial(serial, title, extension, template_card);
++		s_per_game_memcard_extension = std::move(extension);
++		s_per_game_memcard_template = std::move(template_card);
++		s_per_game_memcard_name = FileMcd_GetCardForSerial(
++			serial, title, s_per_game_memcard_extension, s_per_game_memcard_template);
+ 	}
+ 
+ 	if (s_per_game_memcard_name.empty())
+ 		return;
+ 
++	// Slot1_Enable is left alone on purpose: if the user turned slot 1 off, they want it off.
+ 	EmuConfig.Mcd[0].Filename = s_per_game_memcard_name;
+-	EmuConfig.Mcd[0].Enabled = true;
+ }
+ 
+ void VMManager::LoadInputBindings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
+@@ -1213,6 +1221,8 @@
+ void VMManager::ClearDiscDetails()
+ {
+ 	s_per_game_memcard_serial = {};
++	s_per_game_memcard_extension = {};
++	s_per_game_memcard_template = {};
+ 	s_per_game_memcard_name = {};
+ 
+ 	std::unique_lock lock(s_info_mutex);
